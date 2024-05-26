@@ -1,7 +1,7 @@
 /*
  * at45db.c
  *
- * Copyright (c) 2020 Jan Rusnak <jan@rusnak.sk>
+ * Copyright (c) 2024 Jan Rusnak <jan@rusnak.sk>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -33,11 +33,11 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define PAGE_ERASE_TIME   (15 / portTICK_PERIOD_MS)
-#define BLOCK_ERASE_TIME  (45 / portTICK_PERIOD_MS)
-#define CHIP_ERASE_CHECK_TIME  (500 / portTICK_PERIOD_MS)
+#define CHIP_ERASE_CHECK_RATE (500 / portTICK_PERIOD_MS)
 
-static void adrbits(int page, int offs, unsigned char *p);
+static int wait_ready(at45db fi);
+static boolean_t create_address(at45db fi, unsigned char *cmd, int page, int offs);
+static void adrbits(at45db fi, int page, int offs, unsigned char *p);
 #if AT45DB_TEST_CODE == 1
 static int t_device(at45db fi, boolean_t verb);
 static int t_readpage(at45db fi, unsigned char *buf, int page, boolean_t verb);
@@ -58,6 +58,23 @@ int at45db_stat(at45db fi, unsigned int *stat)
 	return (0);
 }
 
+#if AT45DB_USE_EXT_STAT == 1
+/**
+ * at45db_ext_stat
+ */
+int at45db_ext_stat(at45db fi, unsigned int *stat)
+{
+        unsigned char cmd[2] = {0xD7};
+
+        if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd, 2, DMA_OFF)) {
+		return (-EHW);
+	}
+        *stat = cmd[0];
+	*stat |= cmd[1] << 8;
+	return (0);
+}
+#endif
+
 /**
  * at45db_read_mem
  */
@@ -65,13 +82,9 @@ int at45db_read_mem(at45db fi, unsigned char *buf, int page, int offs, int num)
 {
         unsigned char cmd[] = {0xD2, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
 
-        if (page < 0 || page >= fi->pg_count) {
-                return (-EADDR);
-        }
-        if (offs < 0 || offs >= fi->pg_size) {
-                return (-EADDR);
-        }
-        adrbits(page, offs, cmd + 1);
+	if (!create_address(fi, cmd, page, offs)) {
+		return (-EADDR);
+	}
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, sizeof(cmd), buf, num,
 	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
@@ -84,24 +97,18 @@ int at45db_read_mem(at45db fi, unsigned char *buf, int page, int offs, int num)
  */
 int at45db_write_mem(at45db fi, unsigned char *buf, int bfn, int page, int offs, int num)
 {
-        boolean_t first = TRUE;
         unsigned char cmd[] = {0x00, 0x00, 0x00, 0x00};
-        unsigned char stat;
 
         if (bfn == 1) {
                 cmd[0] = 0x82;
         } else if (bfn == 2) {
                 cmd[0] = 0x85;
         } else {
-                return (-EADDR);
+		crit_err_exit(BAD_PARAMETER);
         }
-        if (page < 0 || page >= fi->pg_count) {
-                return (-EADDR);
-        }
-        if (offs < 0 || offs >= fi->pg_size) {
-                return (-EADDR);
-        }
-        adrbits(page, offs, cmd + 1);
+	if (!create_address(fi, cmd, page, offs)) {
+		return (-EADDR);
+	}
         if (bfn == 2) {
                 fi->buf2_ff = FALSE;
         }
@@ -109,39 +116,27 @@ int at45db_write_mem(at45db fi, unsigned char *buf, int bfn, int page, int offs,
 	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
 	}
-        vTaskDelay(PAGE_ERASE_TIME);
-        do {
-                if (!first) {
-                        taskYIELD();
-                } else {
-                        first = FALSE;
-                }
-                stat = 0xD7;
-                if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
-			return (-EHW);
-		}
-        } while (!(stat & AT45DB_FLASH_READY));
-        return (0);
+        vTaskDelay(AT45DB_PAGE_ERASE_TIME);
+	return (wait_ready(fi));
 }
 
 /**
  * at45db_read_buf
  */
-int at45db_read_buf(at45db fi, unsigned char *buf, int bfn, int offset, int num)
+int at45db_read_buf(at45db fi, unsigned char *buf, int bfn, int offs, int num)
 {
         unsigned char cmd[] = {0x00, 0x00, 0x00, 0x00, 0xFF};
 
-        if (offset < 0 || offset >= fi->pg_size) {
-                return (-EADDR);
-        }
         if (bfn == 1) {
                 cmd[0] = 0xD4;
         } else if (bfn == 2) {
                 cmd[0] = 0xD6;
         } else {
-                return (-EADDR);
+                crit_err_exit(BAD_PARAMETER);
         }
-        adrbits(0, offset, cmd + 1);
+	if (!create_address(fi, cmd, 0, offs)) {
+		return (-EADDR);
+	}
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, sizeof(cmd), buf, num,
 	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
@@ -152,21 +147,20 @@ int at45db_read_buf(at45db fi, unsigned char *buf, int bfn, int offset, int num)
 /**
  * at45db_write_buf
  */
-int at45db_write_buf(at45db fi, unsigned char *buf, int bfn, int offset, int num)
+int at45db_write_buf(at45db fi, unsigned char *buf, int bfn, int offs, int num)
 {
         unsigned char cmd[] = {0x00, 0x00, 0x00, 0x00};
 
-        if (offset < 0 || offset >= fi->pg_size) {
-                return (-EADDR);
-        }
         if (bfn == 1) {
                 cmd[0] = 0x84;
         } else if (bfn == 2) {
                 cmd[0] = 0x87;
         } else {
-                return (-EADDR);
+                crit_err_exit(BAD_PARAMETER);
         }
-        adrbits(0, offset, cmd + 1);
+	if (!create_address(fi, cmd, 0, offs)) {
+		return (-EADDR);
+	}
         if (bfn == 2) {
                 fi->buf2_ff = FALSE;
         }
@@ -182,9 +176,7 @@ int at45db_write_buf(at45db fi, unsigned char *buf, int bfn, int offset, int num
  */
 int at45db_store_buf(at45db fi, int bfn, int page, boolean_t erase)
 {
-        boolean_t first = TRUE;
         unsigned char cmd[] = {0x00, 0x00, 0x00, 0x00};
-        unsigned char stat;
 
         if (bfn == 1) {
                 if (erase) {
@@ -199,31 +191,19 @@ int at45db_store_buf(at45db fi, int bfn, int page, boolean_t erase)
                         cmd[0] = 0x89;
                 }
         } else {
-                return (-EADDR);
+                crit_err_exit(BAD_PARAMETER);
         }
-        if (page < 0 || page >= fi->pg_count) {
-                return (-EADDR);
-        }
-        adrbits(page, 0, cmd + 1);
+	if (!create_address(fi, cmd, page, 0)) {
+		return (-EADDR);
+	}
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd + 1, 3,
 			   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
 	}
         if (erase) {
-                vTaskDelay(PAGE_ERASE_TIME);
+                vTaskDelay(AT45DB_PAGE_ERASE_TIME);
         }
-        do {
-                if (!first) {
-                        taskYIELD();
-                } else {
-                        first = FALSE;
-                }
-                stat = 0xD7;
-                if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
-			return (-EHW);
-		}
-        } while (!(stat & AT45DB_FLASH_READY));
-        return (0);
+	return (wait_ready(fi));
 }
 
 /**
@@ -239,12 +219,11 @@ int at45db_load_buf(at45db fi, int bfn, int page)
         } else if (bfn == 2) {
                 cmd[0] = 0x55;
         } else {
-                return (-EADDR);
+                crit_err_exit(BAD_PARAMETER);
         }
-        if (page < 0 || page >= fi->pg_count) {
-                return (-EADDR);
-        }
-        adrbits(page, 0, cmd + 1);
+	if (!create_address(fi, cmd, page, 0)) {
+		return (-EADDR);
+	}
         if (bfn == 2) {
                 fi->buf2_ff = FALSE;
         }
@@ -253,6 +232,7 @@ int at45db_load_buf(at45db fi, int bfn, int page)
 		return (-EHW);
 	}
         do {
+		taskYIELD();
                 stat = 0xD7;
                 if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
 			return (-EHW);
@@ -266,31 +246,17 @@ int at45db_load_buf(at45db fi, int bfn, int page)
  */
 int at45db_page_erase(at45db fi, int page)
 {
-        boolean_t first = TRUE;
         unsigned char cmd[] = {0x81, 0x00, 0x00, 0x00};
-        unsigned char stat;
 
-        if (page < 0 || page >= fi->pg_count) {
-                return (-EADDR);
-        }
-        adrbits(page, 0, cmd + 1);
+	if (!create_address(fi, cmd, page, 0)) {
+		return (-EADDR);
+	}
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd + 1, 3,
 			   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
 	}
-        vTaskDelay(PAGE_ERASE_TIME);
-        do {
-                if (!first) {
-                        taskYIELD();
-                } else {
-                        first = FALSE;
-                }
-                stat = 0xD7;
-                if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
-			return (-EHW);
-		}
-        } while (!(stat & AT45DB_FLASH_READY));
-        return (0);
+        vTaskDelay(AT45DB_PAGE_ERASE_TIME);
+	return (wait_ready(fi));
 }
 
 /**
@@ -298,33 +264,30 @@ int at45db_page_erase(at45db fi, int page)
  */
 int at45db_check_page_erased(at45db fi, int page)
 {
-        void *mem;
         unsigned char cmd[] = {0x00, 0x00, 0x00, 0x00};
+	unsigned char buf[8];
         unsigned char stat;
+	int ret = 0;
 
         if (page < 0 || page >= fi->pg_count) {
                 return (-EADDR);
         }
-        // Fill flash buffer2 with 0xFF pattern.
-        if (!fi->buf2_ff) {
-                mem = pvPortMalloc(fi->pg_size);
-                if (mem == NULL) {
-                        crit_err_exit(MALLOC_ERROR);
-                }
-                memset(mem, 0xFF, fi->pg_size);
-                cmd[0] = 0x87;
-                adrbits(0, 0, cmd + 1);
-                if (0 != spi_trans(fi->spi, &fi->csel, cmd, sizeof(cmd),
-			           mem, fi->pg_size, (fi->use_dma) ? DMA_ON : DMA_OFF)) {
-			vPortFree(mem);
-			return (-EHW);
+        // Fill buffer2 with 0xFF pattern.
+	if (!fi->buf2_ff) {
+		for (int i = 0; i < fi->pg_size / 8; i++) {
+			memset(buf, 0xFF, 8);
+			cmd[0] = 0x87;
+			adrbits(fi, 0, i * 8, cmd + 1);
+	                if (0 != spi_trans(fi->spi, &fi->csel, cmd, sizeof(cmd),
+				           buf, 8, (fi->use_dma) ? DMA_ON : DMA_OFF)) {
+				return (-EHW);
+			}
+			fi->buf2_ff = TRUE;
 		}
-                vPortFree(mem);
-                fi->buf2_ff = TRUE;
-        }
+	}
         // Cmp buffer2 with page.
         cmd[0] = 0x61;
-        adrbits(page, 0, cmd + 1);
+        adrbits(fi, page, 0, cmd + 1);
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd + 1, 3,
 		           (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
@@ -334,12 +297,11 @@ int at45db_check_page_erased(at45db fi, int page)
                 if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
 			return (-EHW);
 		}
+		if (stat & AT45DB_COMPARE_NOT_MATCH) {
+	                ret = -EDATA;
+	        }
         } while (!(stat & AT45DB_FLASH_READY));
-        if (stat & AT45DB_COMPARE_NOT_MATCH) {
-                return (-EERASE);
-        } else {
-                return (0);
-        }
+	return (ret);
 }
 
 /**
@@ -347,32 +309,30 @@ int at45db_check_page_erased(at45db fi, int page)
  */
 int at45db_block_erase(at45db fi, int block)
 {
-        boolean_t first = TRUE;
         unsigned char cmd[] = {0x50, 0x00, 0x00, 0x00};
-        unsigned char stat;
 
         if (block < 0 || block >= fi->bl_count) {
                 return (-EADDR);
         }
-        cmd[1] = block >> 2;
-        cmd[2] = block << 6;
+	switch (fi->pg_size) {
+	case 264 :
+	        cmd[1] = block >> 4;
+		cmd[2] = block << 4;
+		break;
+	case 1056 :
+	        cmd[1] = block >> 2;
+		cmd[2] = block << 6;
+		break;
+	default :
+		crit_err_exit(BAD_PARAMETER);
+		break;
+	}
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd + 1, 3,
 	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
 	}
-        vTaskDelay(BLOCK_ERASE_TIME);
-        do {
-                if (!first) {
-                        taskYIELD();
-                } else {
-                        first = FALSE;
-                }
-                stat = 0xD7;
-                if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
-			return (-EHW);
-		}
-        } while (!(stat & AT45DB_FLASH_READY));
-        return (0);
+        vTaskDelay(AT45DB_BLOCK_ERASE_TIME);
+	return (wait_ready(fi));
 }
 
 /**
@@ -381,20 +341,34 @@ int at45db_block_erase(at45db fi, int block)
 int at45db_chip_erase(at45db fi)
 {
         unsigned char cmd[] = {0xC7, 0x94, 0x80, 0x9A};
-        unsigned char stat;
+	int ret = 0;
 
         if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd + 1, 3,
 	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
 		return (-EHW);
 	}
+#if AT45DB_USE_EXT_STAT == 1
+	unsigned int stat;
         do {
-		vTaskDelay(CHIP_ERASE_CHECK_TIME);
+		vTaskDelay(CHIP_ERASE_CHECK_RATE);
+		if (at45db_ext_stat(fi, &stat) != 0) {
+			return (-EHW);
+		}
+		if (stat & AT45DB_PROG_ERR) {
+			ret = -EDATA;
+		}
+        } while (!(stat & AT45DB_FLASH_READY2));
+#else
+	unsigned char stat;
+        do {
+		vTaskDelay(CHIP_ERASE_CHECK_RATE);
 		stat = 0xD7;
                 if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
 			return (-EHW);
 		}
         } while (!(stat & AT45DB_FLASH_READY));
-	return (0);
+#endif
+	return (ret);
 }
 
 /**
@@ -422,14 +396,180 @@ int at45db_section_erase(at45db fi, int start, int end)
 }
 
 /**
+ * at45db_read_cont
+ */
+int at45db_read_cont(at45db fi, enum at45db_read_cont_type type, unsigned char *buf, int page, int offs, int num)
+{
+        unsigned char cmd[] = {type, 0x00, 0x00, 0x00, 0xFF, 0xFF};
+	int cmd_sz = 0;
+
+	if (!create_address(fi, cmd, page, offs)) {
+		return (-EADDR);
+	}
+	switch (type) {
+	case AT45DB_READ_CONT_HF0 :
+		cmd_sz = 5;
+		break;
+	case AT45DB_READ_CONT_HF1 :
+		cmd_sz = 6;
+		break;
+	case AT45DB_READ_CONT_LF :
+		/* FALLTHRU */
+	case AT45DB_READ_CONT_LP :
+		cmd_sz = 4;
+		break;
+	default :
+		crit_err_exit(BAD_PARAMETER);
+		break;
+	}
+        if (0 != spi_trans(fi->spi, &fi->csel, cmd, cmd_sz, buf, num,
+	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
+		return (-EHW);
+	}
+	return (0);
+}
+
+/**
+ * at45db_read_mod_write
+ */
+int at45db_read_mod_write(at45db fi, unsigned char *buf, int bfn, int page, int offs, int num)
+{
+        unsigned char cmd[] = {0x00, 0x00, 0x00, 0x00};
+
+        if (bfn == 1) {
+                cmd[0] = 0x58;
+        } else if (bfn == 2) {
+                cmd[0] = 0x59;
+        } else {
+                crit_err_exit(BAD_PARAMETER);
+        }
+	if (!create_address(fi, cmd, page, offs)) {
+		return (-EADDR);
+	}
+        if (bfn == 2) {
+                fi->buf2_ff = FALSE;
+        }
+        if (0 != spi_trans(fi->spi, &fi->csel, cmd, sizeof(cmd), buf, num,
+	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
+		return (-EHW);
+	}
+        vTaskDelay(AT45DB_PAGE_ERASE_PROG_TIME);
+	return (wait_ready(fi));
+}
+
+/**
+ * at45db_pwr_down
+ */
+int at45db_pwr_down(at45db fi, enum at45db_pwr_down_type type)
+{
+	unsigned char cmd = type;
+
+	switch (cmd) {
+	case AT45DB_ULTRA_DEEP_PWR_DOWN :
+		fi->buf2_ff = FALSE;
+		/* FALLTHRU */
+	case AT45DB_DEEP_PWR_DOWN :
+		break;
+	default :
+		crit_err_exit(BAD_PARAMETER);
+		break;
+	}
+        if (0 != spi_trans(fi->spi, &fi->csel, &cmd, 1, &cmd, 0, DMA_OFF)) {
+		return (-EHW);
+	}
+	return (0);
+}
+
+/**
+ * at45db_wake
+ */
+int at45db_wake(at45db fi)
+{
+	unsigned char cmd = 0xAB;
+
+        if (0 != spi_trans(fi->spi, &fi->csel, &cmd, 1, &cmd, 0, DMA_OFF)) {
+		return (-EHW);
+	}
+	return (0);
+}
+
+/**
+ * wait_ready
+ */
+static int wait_ready(at45db fi)
+{
+	boolean_t first = TRUE;
+	int ret = 0;
+
+#if AT45DB_USE_EXT_STAT == 1
+	unsigned int stat;
+        do {
+                if (!first) {
+                        taskYIELD();
+                } else {
+                        first = FALSE;
+                }
+		if (at45db_ext_stat(fi, &stat) != 0) {
+			return (-EHW);
+		}
+		if (stat & AT45DB_PROG_ERR) {
+			ret = -EDATA;
+		}
+        } while (!(stat & AT45DB_FLASH_READY2));
+#else
+	unsigned char stat;
+        do {
+                if (!first) {
+                        taskYIELD();
+                } else {
+                        first = FALSE;
+                }
+                stat = 0xD7;
+                if (0 != spi_trans(fi->spi, &fi->csel, &stat, 1, &stat, 1, DMA_OFF)) {
+			return (-EHW);
+		}
+        } while (!(stat & AT45DB_FLASH_READY));
+#endif
+        return (ret);
+}
+
+/**
+ * create_address
+ */
+static boolean_t create_address(at45db fi, unsigned char *cmd, int page, int offs)
+{
+        if (page < 0 || page >= fi->pg_count) {
+                return (FALSE);
+        }
+        if (offs < 0 || offs >= fi->pg_size) {
+                return (FALSE);
+        }
+        adrbits(fi, page, offs, cmd + 1);
+	return (TRUE);
+}
+
+/**
  * adrbits
  */
-static void adrbits(int page, int offs, unsigned char *p)
+static void adrbits(at45db fi, int page, int offs, unsigned char *p)
 {
-        *p = page >> 5;
-        *(p + 1) = page << 3;
-        *(p + 1) |= (offs >> 8) & 0x7;
-        *(p + 2) = offs;
+	switch (fi->pg_size) {
+	case 264 :
+	        *p = page >> 7;
+	        *(p + 1) = page << 1;
+	        *(p + 1) |= (offs >> 8) & 0x1;
+	        *(p + 2) = offs;
+		break;
+	case 1056 :
+	        *p = page >> 5;
+	        *(p + 1) = page << 3;
+	        *(p + 1) |= (offs >> 8) & 0x7;
+	        *(p + 2) = offs;
+		break;
+	default :
+		crit_err_exit(BAD_PARAMETER);
+		break;
+	}
 }
 
 #if AT45DB_TEST_CODE == 1
