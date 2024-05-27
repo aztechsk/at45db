@@ -282,6 +282,21 @@ int at45db_pwr_down(at45db fi, enum at45db_pwr_down_type type);
  */
 int at45db_wake(at45db fi);
 
+enum at45db_page_size {
+	AT45DB_SET_PAGE_SIZE_PO2 = 0xA6,
+	AT45DB_SET_PAGE_SIZE_STD = 0xA7
+};
+
+/**
+ * at45db_set_page_size - page size configuration.
+ *
+ * @fi: Flash instance.
+ * @sz: Flash page size (enum at45db_page_size).
+ *
+ * Returns: 0 - success; -EHW - hardware error.
+ */
+int at45db_set_page_size(at45db fi, enum at45db_page_size sz);
+
 #if AT45DB_TEST_CODE == 1
 /**
  * at45db_rw_test - test flash RW operations by data integrity.

@@ -494,6 +494,24 @@ int at45db_wake(at45db fi)
 }
 
 /**
+ * at45db_set_page_size
+ */
+int at45db_set_page_size(at45db fi, enum at45db_page_size sz)
+{
+	unsigned char cmd[] = {0x3D, 0x2A, 0x80, 0x00};
+
+	if (sz != AT45DB_SET_PAGE_SIZE_PO2 && sz != AT45DB_SET_PAGE_SIZE_STD) {
+		crit_err_exit(BAD_PARAMETER);
+	}
+	cmd[3] = sz;
+	if (0 != spi_trans(fi->spi, &fi->csel, cmd, 1, cmd + 1, 3,
+	                   (fi->use_dma) ? DMA_ON : DMA_OFF)) {
+		return (-EHW);
+	}
+	return (0);
+}
+
+/**
  * wait_ready
  */
 static int wait_ready(at45db fi)
