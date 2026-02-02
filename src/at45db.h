@@ -30,8 +30,8 @@ struct at45db_dsc {
         int pg_count;  // <SetIt>
         int pg_size;   // <SetIt>
         int bl_count;  // <SetIt>
-        spim spi;      // <SetIt>
-        struct spim_csel_dcs csel;  // <SetIt>
+        spibus spi;    // <SetIt>
+        struct spi_csel_dcs csel;  // <SetIt>
         char *id;          // <SetIt>
 	boolean_t use_dma; // <SetIt>
         boolean_t buf2_ff; // <SetIt> FALSE
